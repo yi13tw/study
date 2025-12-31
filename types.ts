@@ -26,7 +26,6 @@ export interface WeeklyReport {
   nextWeekStrategy: string;
   needsSupport: boolean;
   supportDetail: string;
-  aiFeedback?: string;
   createdAt: string;
 }
 
