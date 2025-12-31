@@ -1,8 +1,6 @@
 
 export interface StudySession {
   id: string;
-  startTime: number;
-  endTime: number;
   durationMinutes: number;
   date: string; // YYYY-MM-DD
 }
@@ -11,21 +9,13 @@ export interface DailyLog {
   id: string;
   date: string;
   content: string;
-  gap?: string;
-}
-
-export interface MemberSummary {
-  userName: string;
-  totalHours: number;
-  completionRate: number;
-  status: 'focusing' | 'idle' | 'break';
-  lastActive: string;
+  gap: string;
 }
 
 export interface WeeklyReport {
   id: string;
   userName: string;
-  weekStart: string; // Monday's date
+  weekStart: string;
   totalHours: number;
   plannedProgress: string;
   actualProgress: string;
@@ -36,8 +26,14 @@ export interface WeeklyReport {
   nextWeekStrategy: string;
   needsSupport: boolean;
   supportDetail: string;
-  createdAt: string;
   aiFeedback?: string;
+  createdAt: string;
 }
 
-export type TabType = 'timer' | 'report' | 'dashboard';
+export interface MemberSummary {
+  userName: string;
+  totalHours: number;
+  completionRate: number;
+  lastUpdate: string;
+  status: string;
+}
