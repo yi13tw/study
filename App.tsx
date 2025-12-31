@@ -1,207 +1,268 @@
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Timer as TimerIcon, FileText, LayoutDashboard, UserCircle, Settings, CloudSync } from 'lucide-react';
-import { format, isSameWeek, parseISO } from 'date-fns';
-import { StudySession, WeeklyReport, TabType, DailyLog, MemberSummary } from './types';
-import Timer from './components/Timer';
-import ReportForm from './components/ReportForm';
-import Dashboard from './components/Dashboard';
-import DailyTracker from './components/DailyTracker';
-import { getMondayOfCurrentWeek } from './constants';
-import { getWeeklyAIAnalysis } from './services/geminiService';
-import { syncToSheets, fetchGroupData } from './services/sheetService';
+import { ref, reactive, computed, onMounted, watch } from 'vue';
+import { 
+  Timer as IconTimer, 
+  FileText as IconFile, 
+  LayoutDashboard as IconBoard, 
+  Settings as IconSettings,
+  Zap, Play, Square, RotateCcw, Target, Plus, CheckCircle, Send, Sparkles, Trophy
+} from 'lucide-vue-next';
+import { format, isSameWeek, parseISO, startOfWeek } from 'date-fns';
+import { GoogleGenAI } from "@google/genai";
 
-const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<TabType>('timer');
-  const [userName, setUserName] = useState<string>(localStorage.getItem('study_user_name') || '');
-  const [isNaming, setIsNaming] = useState(!userName);
-  const [sessions, setSessions] = useState<StudySession[]>([]);
-  const [reports, setReports] = useState<WeeklyReport[]>([]);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  
-  // Google Sheets Config
-  const [sheetUrl, setSheetUrl] = useState<string>(localStorage.getItem('study_sheet_url') || '');
-  const [showSettings, setShowSettings] = useState(false);
-  const [groupData, setGroupData] = useState<MemberSummary[]>([]);
+export default {
+  components: { 
+    IconTimer, IconFile, IconBoard, IconSettings, 
+    Zap, Play, Square, RotateCcw, Target, Plus, CheckCircle, Send, Sparkles, Trophy
+  },
+  setup() {
+    // --- 狀態定義 ---
+    const activeTab = ref('timer');
+    const userName = ref(localStorage.getItem('study_user_name') || '');
+    const isNaming = ref(!userName.value);
+    const sheetUrl = ref("https://script.google.com/macros/s/AKfycbx93tB14D6-W-Pft_As2w6zgQtMN6iTiGowkv99_q0LJsfHLMqbiH5OX5OvAKK2hlA4/exec");
+    
+    // 計時器狀態
+    const timeLeft = ref(25 * 60);
+    const timerActive = ref(false);
+    const isBreak = ref(false);
+    let timerInterval = null;
 
-  const [weeklyPlan, setWeeklyPlan] = useState<string>(localStorage.getItem('study_weekly_plan') || '');
-  const [dailyLogs, setDailyLogs] = useState<DailyLog[]>([]);
+    // 資料存儲
+    const sessions = ref(JSON.parse(localStorage.getItem('study_sessions') || '[]'));
+    const dailyLogs = ref(JSON.parse(localStorage.getItem('study_daily_logs') || '[]'));
+    const weeklyPlan = ref(localStorage.getItem('study_weekly_plan') || '');
+    const reports = ref(JSON.parse(localStorage.getItem('study_reports') || '[]'));
+    const groupMembers = ref([]);
+    const isSyncing = ref(false);
 
-  // 初始載入與定時更新群組數據
-  useEffect(() => {
-    const loadInitialData = async () => {
-      const savedSessions = localStorage.getItem('study_sessions');
-      const savedReports = localStorage.getItem('study_reports');
-      const savedDailyLogs = localStorage.getItem('study_daily_logs');
-      
-      if (savedSessions) setSessions(JSON.parse(savedSessions));
-      if (savedReports) setReports(JSON.parse(savedReports));
-      if (savedDailyLogs) {
-        const logs = JSON.parse(savedDailyLogs);
-        const currentMonday = parseISO(getMondayOfCurrentWeek());
-        setDailyLogs(logs.filter((log: any) => isSameWeek(parseISO(log.date), currentMonday, { weekStartsOn: 1 })));
-      }
+    // --- 計算屬性 ---
+    const currentWeekHours = computed(() => {
+      const monday = format(startOfWeek(new Date(), { weekStartsOn: 1 }), 'yyyy-MM-dd');
+      const weekSessions = sessions.value.filter(s => s.date >= monday);
+      return weekSessions.reduce((acc, s) => acc + s.durationMinutes, 0) / 60;
+    });
 
-      if (sheetUrl) {
-        const data = await fetchGroupData(sheetUrl);
-        if (data.length > 0) {
-          setGroupData(data.map(d => ({ ...d, lastActive: '剛剛' } as MemberSummary)));
-        }
+    const timerDisplay = computed(() => {
+      const m = Math.floor(timeLeft.value / 60).toString().padStart(2, '0');
+      const s = (timeLeft.value % 60).toString().padStart(2, '0');
+      return `${m}:${s}`;
+    });
+
+    const progress = computed(() => {
+      const total = isBreak.value ? 5 * 60 : 25 * 60;
+      return ((total - timeLeft.value) / total) * 100;
+    });
+
+    // --- 方法 ---
+    const saveName = () => {
+      if (userName.value.trim()) {
+        localStorage.setItem('study_user_name', userName.value);
+        isNaming.value = false;
+        syncData();
       }
     };
-    loadInitialData();
-  }, [sheetUrl]);
 
-  // 每當 sessions 或 logs 變化，同步到雲端
-  useEffect(() => {
-    localStorage.setItem('study_sessions', JSON.stringify(sessions));
-    localStorage.setItem('study_reports', JSON.stringify(reports));
-    localStorage.setItem('study_weekly_plan', weeklyPlan);
-    localStorage.setItem('study_daily_logs', JSON.stringify(dailyLogs));
-    localStorage.setItem('study_sheet_url', sheetUrl);
+    const toggleTimer = () => {
+      if (timerActive.value) {
+        clearInterval(timerInterval);
+      } else {
+        timerInterval = setInterval(() => {
+          if (timeLeft.value > 0) {
+            timeLeft.value--;
+          } else {
+            completeSession();
+          }
+        }, 1000);
+      }
+      timerActive.value = !timerActive.value;
+    };
 
-    if (sheetUrl && userName) {
-      const myHours = sessions.reduce((acc, s) => acc + s.durationMinutes, 0) / 60;
-      syncToSheets(sheetUrl, {
-        userName,
-        totalHours: myHours,
-        completionRate: reports[0]?.completionRate || (dailyLogs.length * 15),
-        lastUpdate: new Date().toISOString(),
-        status: '學習中'
+    const completeSession = () => {
+      clearInterval(timerInterval);
+      timerActive.value = false;
+      if (!isBreak.value) {
+        const mins = 25;
+        sessions.value.push({
+          id: Date.now().toString(),
+          durationMinutes: mins,
+          date: format(new Date(), 'yyyy-MM-dd')
+        });
+        alert("🎉 專注結束！辛苦了，休息一下吧。");
+        timeLeft.value = 5 * 60;
+        isBreak.value = true;
+        syncData();
+      } else {
+        alert("💪 休息結束，準備好迎接下一個 25 分鐘了嗎？");
+        timeLeft.value = 25 * 60;
+        isBreak.value = false;
+      }
+    };
+
+    const addDailyLog = (content, gap) => {
+      dailyLogs.value.push({
+        id: Date.now().toString(),
+        date: format(new Date(), 'yyyy-MM-dd'),
+        content,
+        gap
       });
-    }
-  }, [sessions, reports, weeklyPlan, dailyLogs, sheetUrl, userName]);
+      syncData();
+    };
 
-  const calculateWeeklyHours = useCallback(() => {
-    const currentMonday = parseISO(getMondayOfCurrentWeek());
-    const weekSessions = sessions.filter(s => isSameWeek(parseISO(s.date), currentMonday, { weekStartsOn: 1 }));
-    return weekSessions.reduce((acc, s) => acc + s.durationMinutes, 0) / 60;
-  }, [sessions]);
+    const syncData = async () => {
+      if (!sheetUrl.value || !userName.value) return;
+      isSyncing.value = true;
+      try {
+        const data = {
+          userName: userName.value,
+          totalHours: currentWeekHours.value,
+          completionRate: reports.value[0]?.completionRate || (dailyLogs.value.length * 15),
+          lastUpdate: new Date().toISOString(),
+          status: timerActive.value ? '專注中' : '休息中'
+        };
+        await fetch(sheetUrl.value, {
+          method: 'POST',
+          mode: 'no-cors',
+          body: JSON.stringify(data)
+        });
+        
+        // 抓取其他人的數據
+        const res = await fetch(sheetUrl.value);
+        const cloudData = await res.json();
+        groupMembers.value = cloudData.sort((a, b) => b.totalHours - a.totalHours);
+      } catch (e) {
+        console.error("同步失敗", e);
+      } finally {
+        isSyncing.value = false;
+      }
+    };
 
-  // 合併雲端數據與本地模擬數據 (若雲端沒資料則顯示模擬)
-  const finalGroupMembers = useMemo(() => {
-    if (groupData.length > 0) return groupData.sort((a, b) => b.totalHours - a.totalHours);
-    
-    // 預設模擬數據
-    const mock: MemberSummary[] = [
-      { userName: '阿強 (隊長)', totalHours: 28.5, completionRate: 95, status: 'idle', lastActive: '10 min' },
-      { userName: '小美', totalHours: 22.1, completionRate: 88, status: 'focusing', lastActive: 'now' },
-    ];
-    const me = { userName: userName || '我', totalHours: calculateWeeklyHours(), completionRate: reports[0]?.completionRate || (dailyLogs.length * 15), status: 'focusing' as any, lastActive: 'now' };
-    return [me, ...mock].sort((a, b) => b.totalHours - a.totalHours);
-  }, [groupData, calculateWeeklyHours, reports, dailyLogs, userName]);
+    // 監聽並持久化
+    watch([sessions, dailyLogs, weeklyPlan, reports], () => {
+      localStorage.setItem('study_sessions', JSON.stringify(sessions.value));
+      localStorage.setItem('study_daily_logs', JSON.stringify(dailyLogs.value));
+      localStorage.setItem('study_weekly_plan', weeklyPlan.value);
+      localStorage.setItem('study_reports', JSON.stringify(reports.value));
+    }, { deep: true });
 
-  if (isNaming) {
-    return (
-      <div className="min-h-screen bg-blue-600 flex items-center justify-center p-8">
-        <div className="bg-white p-8 rounded-[2.5rem] shadow-2xl w-full max-w-sm text-center">
-          <div className="w-20 h-20 bg-blue-50 rounded-3xl flex items-center justify-center mx-auto mb-6 text-blue-600">
-            <UserCircle size={48} />
+    onMounted(syncData);
+
+    return {
+      activeTab, userName, isNaming, isSyncing,
+      timeLeft, timerActive, isBreak, timerDisplay, progress, toggleTimer,
+      sessions, dailyLogs, weeklyPlan, reports, currentWeekHours, groupMembers,
+      saveName, addDailyLog, syncData
+    };
+  },
+  template: `
+    <div class="min-h-screen bg-[#FDFDFF] text-gray-900 pb-28">
+      <!-- 登入頁 -->
+      <div v-if="isNaming" class="fixed inset-0 z-[200] bg-blue-600 flex items-center justify-center p-8">
+        <div class="bg-white p-8 rounded-[3rem] shadow-2xl w-full max-w-sm text-center transform animate-in zoom-in duration-500">
+          <div class="w-20 h-20 bg-blue-50 text-blue-600 rounded-3xl flex items-center justify-center mx-auto mb-6">
+             <zap size="40" fill="currentColor" />
           </div>
-          <h1 className="text-2xl font-black text-gray-900 mb-2">歡迎戰友</h1>
-          <p className="text-gray-400 text-sm mb-8">輸入姓名開啟你的備考儀表板</p>
-          <form onSubmit={(e) => { e.preventDefault(); if(userName) setIsNaming(false); }} className="space-y-4">
-            <input 
-              required className="w-full bg-gray-50 p-4 rounded-2xl border-none ring-2 ring-transparent focus:ring-blue-500 transition-all text-center text-lg font-bold"
-              placeholder="您的姓名" value={userName} onChange={e => setUserName(e.target.value)}
-            />
-            <button className="w-full bg-blue-600 text-white py-4 rounded-2xl font-bold text-lg shadow-lg shadow-blue-200">
-              開始讀書
-            </button>
-          </form>
+          <h1 class="text-3xl font-black text-gray-900 mb-2">準備好衝刺？</h1>
+          <p class="text-gray-400 text-sm mb-8 font-medium">請輸入戰友姓名進入讀書會</p>
+          <div class="space-y-4">
+            <input v-model="userName" class="w-full bg-gray-50 p-5 rounded-2xl border-none ring-2 ring-transparent focus:ring-blue-500 outline-none text-center text-xl font-bold transition-all" placeholder="您的姓名" />
+            <button @click="saveName" class="w-full bg-blue-600 text-white py-5 rounded-2xl font-bold text-lg shadow-xl shadow-blue-100 active:scale-95 transition-all">進入書房</button>
+          </div>
         </div>
       </div>
-    );
-  }
 
-  return (
-    <div className="min-h-screen bg-[#FDFDFF] text-gray-900 pb-28">
-      {/* Top Header */}
-      <header className="px-6 py-6 flex justify-between items-center sticky top-0 bg-white/80 backdrop-blur-md z-50 border-b border-gray-50">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-blue-600 rounded-2xl flex items-center justify-center text-white font-bold shadow-lg shadow-blue-100">S</div>
+      <!-- Header -->
+      <header class="px-6 py-6 flex justify-between items-center sticky top-0 bg-white/80 backdrop-blur-xl z-50 border-b border-gray-50">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 bg-blue-600 rounded-2xl flex items-center justify-center text-white font-bold shadow-lg shadow-blue-100">S</div>
           <div>
-            <h1 className="text-base font-black tracking-tight">STUDYBUDDY</h1>
-            <p className="text-[10px] font-bold text-blue-500 uppercase tracking-widest">FIRE SAFETY APP</p>
+            <h1 class="text-base font-black tracking-tight leading-none uppercase">StudyBuddy</h1>
+            <p class="text-[10px] font-bold text-blue-500 uppercase tracking-widest mt-1">備考 App 專業版</p>
           </div>
         </div>
-        <button onClick={() => setShowSettings(true)} className="p-3 bg-gray-50 rounded-2xl text-gray-400 hover:text-blue-600 transition-all">
-          <Settings size={20} />
-        </button>
+        <div v-if="isSyncing" class="w-8 h-8 rounded-full border-2 border-blue-100 border-t-blue-600 animate-spin"></div>
+        <div v-else class="text-right">
+            <p class="text-[10px] text-gray-400 font-bold uppercase">本週努力</p>
+            <p class="text-sm font-black text-blue-600">{{ currentWeekHours.toFixed(1) }} HR</p>
+        </div>
       </header>
 
-      {/* Main Content */}
-      <main className="px-5 pt-4">
-        {activeTab === 'timer' && (
-          <div className="space-y-8 animate-in fade-in duration-500">
-            <Timer onSessionComplete={(m) => setSessions(prev => [...prev, { id: crypto.randomUUID(), startTime: Date.now(), endTime: Date.now(), durationMinutes: m, date: format(new Date(), 'yyyy-MM-dd') }])} />
-            <DailyTracker weeklyPlan={weeklyPlan} onUpdatePlan={setWeeklyPlan} dailyLogs={dailyLogs} onAddLog={(c, g) => setDailyLogs(prev => [...prev, { id: crypto.randomUUID(), date: format(new Date(), 'yyyy-MM-dd'), content: c, gap: g }])} />
+      <main class="px-5 pt-6">
+        <!-- 頁面 1: 計時與追蹤 -->
+        <div v-if="activeTab === 'timer'" class="space-y-8 animate-in fade-in slide-in-from-bottom-4">
+          <!-- 番茄鐘卡片 -->
+          <div class="bg-white p-8 rounded-[2.5rem] shadow-xl border border-gray-50 flex flex-col items-center relative overflow-hidden">
+             <div class="absolute -top-10 -right-10 w-40 h-40 bg-blue-50 rounded-full blur-3xl opacity-50"></div>
+             <div class="mb-6 px-4 py-2 rounded-full font-bold text-xs uppercase tracking-widest" :class="isBreak ? 'bg-green-100 text-green-600' : 'bg-blue-100 text-blue-600'">
+                {{ isBreak ? '休息時間' : '專注學習中' }}
+             </div>
+             
+             <div class="relative w-56 h-56 flex items-center justify-center">
+                <svg class="w-full h-full transform -rotate-90">
+                  <circle cx="112" cy="112" r="100" stroke="currentColor" stroke-width="12" fill="transparent" class="text-gray-50" />
+                  <circle cx="112" cy="112" r="100" stroke="currentColor" stroke-width="12" fill="transparent" 
+                    :stroke-dasharray="628" :stroke-dashoffset="628 - (628 * progress) / 100"
+                    class="transition-all duration-1000 ease-linear" :class="isBreak ? 'text-green-500' : 'text-blue-600'" stroke-linecap="round" />
+                </svg>
+                <div class="absolute text-5xl font-black tracking-tighter">{{ timerDisplay }}</div>
+             </div>
+
+             <div class="mt-8 flex gap-4">
+                <button @click="toggleTimer" class="w-20 h-20 rounded-3xl flex items-center justify-center text-white shadow-2xl active:scale-90 transition-all" :class="timerActive ? 'bg-amber-500 shadow-amber-100' : 'bg-blue-600 shadow-blue-100'">
+                   <component :is="timerActive ? 'IconSquare' : 'IconPlay'" size="32" fill="currentColor" />
+                </button>
+                <button @click="timeLeft = 25*60; timerActive=false" class="w-20 h-20 rounded-3xl bg-gray-50 text-gray-400 flex items-center justify-center active:scale-90 transition-all">
+                   <icon-rotate-ccw size="32" />
+                </button>
+             </div>
           </div>
-        )}
 
-        {activeTab === 'report' && (
-          <ReportForm currentWeekHours={calculateWeeklyHours()} userName={userName} weeklyPlan={weeklyPlan} dailyLogs={dailyLogs} onSubmit={async (r) => {
-            setIsSubmitting(true);
-            const aiFeedback = await getWeeklyAIAnalysis(r);
-            setReports(prev => [{ ...r, aiFeedback }, ...prev]);
-            setDailyLogs([]);
-            setWeeklyPlan('');
-            setIsSubmitting(false);
-            setActiveTab('dashboard');
-          }} />
-        )}
+          <!-- 每日回報小卡 -->
+          <div class="bg-gray-900 text-white p-6 rounded-[2.5rem] shadow-2xl">
+             <div class="flex items-center gap-2 mb-4">
+                <target size="20" class="text-blue-400" />
+                <h3 class="font-bold">今日進度快報</h3>
+             </div>
+             <input @keyup.enter="addDailyLog($event.target.value, '')" class="w-full bg-white/10 p-4 rounded-2xl border-none outline-none focus:ring-2 focus:ring-blue-500 mb-2 font-medium" placeholder="今天讀了什麼？" />
+             <p class="text-[10px] text-gray-400 text-center uppercase tracking-widest font-bold">輸入後按下 Enter 儲存</p>
+          </div>
+        </div>
 
-        {activeTab === 'dashboard' && (
-          <Dashboard reports={reports} sessions={sessions} userName={userName} groupMembers={finalGroupMembers} />
-        )}
+        <!-- 頁面 3: 看板 -->
+        <div v-if="activeTab === 'dashboard'" class="space-y-6 animate-in fade-in">
+           <div class="grid grid-cols-2 gap-4">
+              <div v-for="(member, idx) in groupMembers.slice(0, 4)" :key="idx" class="bg-white p-5 rounded-[2rem] shadow-sm border border-gray-50 relative overflow-hidden">
+                 <div class="text-[40px] font-black absolute -right-2 -bottom-4 opacity-5">{{ idx + 1 }}</div>
+                 <div class="flex items-center gap-2 mb-3">
+                    <div class="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center text-blue-600 text-xs font-bold">{{ member.userName[0] }}</div>
+                    <span class="text-xs font-black truncate max-w-[60px]">{{ member.userName }}</span>
+                 </div>
+                 <p class="text-xl font-black">{{ member.totalHours.toFixed(1) }} <span class="text-[10px] text-gray-400 uppercase">hrs</span></p>
+                 <div class="w-full bg-gray-100 h-1 rounded-full mt-2 overflow-hidden">
+                    <div class="h-full bg-blue-500" :style="{ width: member.completionRate + '%' }"></div>
+                 </div>
+              </div>
+           </div>
+
+           <div class="bg-blue-600 p-8 rounded-[2.5rem] text-white shadow-2xl shadow-blue-200">
+              <sparkles class="mb-4" />
+              <h3 class="text-2xl font-black mb-2">戰友加油站</h3>
+              <p class="text-sm opacity-80 leading-relaxed font-medium">目前大家平均每週投入 24.5 小時。你是讀書會的領頭羊，保持節奏，證照就在不遠處！</p>
+           </div>
+        </div>
       </main>
 
-      {/* Settings Modal */}
-      {showSettings && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[100] flex items-end">
-          <div className="bg-white w-full rounded-t-[2.5rem] p-8 animate-in slide-in-from-bottom-full duration-300">
-            <div className="w-12 h-1 bg-gray-200 rounded-full mx-auto mb-8" />
-            <h3 className="text-xl font-black mb-6">同步設定</h3>
-            <div className="space-y-6">
-              <div>
-                <label className="text-xs font-bold text-gray-400 uppercase mb-2 block">Google Sheets API URL</label>
-                <input 
-                  className="w-full bg-gray-50 p-4 rounded-2xl border-none ring-2 ring-gray-100 focus:ring-blue-500 outline-none"
-                  placeholder="輸入 GAS 部署網址..." value={sheetUrl} onChange={e => setSheetUrl(e.target.value)}
-                />
-                <p className="text-[10px] text-gray-400 mt-2">整合此網址後，您的進度將與讀書會成員即時同步。</p>
-              </div>
-              <button onClick={() => setShowSettings(false)} className="w-full bg-blue-600 text-white py-4 rounded-2xl font-bold">儲存並關閉</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Bottom Navigation */}
-      <nav className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-white/90 backdrop-blur-2xl border border-gray-100 shadow-[0_20px_50px_rgba(0,0,0,0.1)] rounded-[2rem] px-4 py-3 flex gap-3 z-50">
-        {[
-          { id: 'timer', icon: TimerIcon, label: '專注' },
-          { id: 'report', icon: FileText, label: '結報' },
-          { id: 'dashboard', icon: LayoutDashboard, label: '看板' }
-        ].map(tab => (
-          <button 
-            key={tab.id} onClick={() => setActiveTab(tab.id as TabType)}
-            className={`flex items-center gap-2 px-6 py-3 rounded-2xl font-bold transition-all ${activeTab === tab.id ? 'bg-blue-600 text-white shadow-lg shadow-blue-100' : 'text-gray-400 hover:text-gray-600'}`}
-          >
-            <tab.icon size={20} />
-            <span className="text-sm">{tab.label}</span>
-          </button>
-        ))}
+      <!-- 底部導航欄 -->
+      <nav class="fixed bottom-8 left-6 right-6 glass border border-white/50 shadow-2xl rounded-[2.5rem] px-4 py-3 flex justify-around items-center z-[100]">
+        <button @click="activeTab = 'timer'" class="flex flex-col items-center gap-1 transition-all" :class="activeTab === 'timer' ? 'text-blue-600 scale-110' : 'text-gray-400'">
+           <icon-timer size="24" :stroke-width="activeTab === 'timer' ? 3 : 2" />
+           <span class="text-[10px] font-black uppercase">專注</span>
+        </button>
+        <button @click="activeTab = 'dashboard'" class="flex flex-col items-center gap-1 transition-all" :class="activeTab === 'dashboard' ? 'text-blue-600 scale-110' : 'text-gray-400'">
+           <icon-board size="24" :stroke-width="activeTab === 'dashboard' ? 3 : 2" />
+           <span class="text-[10px] font-black uppercase">看板</span>
+        </button>
       </nav>
-
-      {isSubmitting && (
-        <div className="fixed inset-0 bg-white/80 backdrop-blur-lg z-[200] flex flex-col items-center justify-center">
-          <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-4" />
-          <p className="font-bold text-gray-800">正在生成 AI 戰略與同步雲端...</p>
-        </div>
-      )}
     </div>
-  );
+  `
 };
-
-export default App;
